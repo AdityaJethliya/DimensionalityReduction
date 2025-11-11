@@ -976,23 +976,32 @@ def optimize_autoencoder(X, y, dataset_name, data_type='continuous'):
                         model = Autoencoder(input_dim, architecture, latent_dim).to(device)
                         criterion = nn.MSELoss()
                         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-                        
-                        X_tensor = torch.FloatTensor(X_scaled).to(device)
+
+                        # Keep data on CPU for pin_memory to work
+                        X_tensor = torch.FloatTensor(X_scaled)
                         dataset = TensorDataset(X_tensor, X_tensor)
-                        dataloader = DataLoader(dataset, batch_size=256, shuffle=True, num_workers=0, pin_memory=True)
-                        
+                        # pin_memory=True only when using CUDA, and only works with CPU tensors
+                        use_pin_memory = (device.type == 'cuda')
+                        dataloader = DataLoader(dataset, batch_size=256, shuffle=True, num_workers=0, pin_memory=use_pin_memory)
+
                         model.train()
                         for epoch in range(epochs):
                             for batch_X, batch_y in dataloader:
+                                # Move batch to device
+                                batch_X = batch_X.to(device)
+                                batch_y = batch_y.to(device)
+
                                 optimizer.zero_grad()
                                 outputs = model(batch_X)
                                 loss = criterion(outputs, batch_y)
                                 loss.backward()
                                 optimizer.step()
-                        
+
                         model.eval()
                         with torch.no_grad():
-                            embedding = model.encode(X_tensor).cpu().numpy()
+                            # Move data to device for inference
+                            X_tensor_device = X_tensor.to(device)
+                            embedding = model.encode(X_tensor_device).cpu().numpy()
                         
                         runtime = time.perf_counter() - start_time
                         
