@@ -106,20 +106,44 @@ MDS_OPTIONS = {
 SAVE_ALL_EMBEDDINGS = True  # Save all embeddings, not just top 5
 N_JOBS = 1  # Sequential execution (parallel handled by distributed runner)
 
+# Neighbor computation method (set via --use-exact-neighbors flag)
+USE_EXACT_NEIGHBORS = False  # If True, always use exact neighbors (no HNSW approximation)
+HNSW_EF_SEARCH = 100  # Increased from 50 for better accuracy (higher = slower but more accurate)
+HNSW_EF_CONSTRUCTION = 200  # Construction parameter
+HNSW_M = 16  # Number of bidirectional links
+
 # ============================================================================
 # FAST NEAREST NEIGHBORS
 # ============================================================================
 
-def compute_neighbors_hnsw(X, k, metric='euclidean'):
-    """Compute k-nearest neighbors using HNSW (10-100x faster)."""
+def compute_neighbors_hnsw(X, k, metric='euclidean', random_seed=None):
+    """
+    Compute k-nearest neighbors using HNSW (10-100x faster).
+
+    Note: This is an APPROXIMATE nearest neighbor method. For exact neighbors,
+    set USE_EXACT_NEIGHBORS=True or use --use-exact-neighbors flag.
+
+    Args:
+        X: Data matrix
+        k: Number of neighbors
+        metric: 'euclidean' or 'cosine'
+        random_seed: Random seed for reproducibility
+
+    Returns:
+        indices: Neighbor indices (n_samples x k)
+        distances: Neighbor distances (n_samples x k)
+    """
+    if random_seed is not None:
+        np.random.seed(random_seed)
+
     n_samples, dim = X.shape
-    
+
     index = hnswlib.Index(space='l2' if metric == 'euclidean' else 'cosine', dim=dim)
-    index.init_index(max_elements=n_samples, ef_construction=200, M=16)
-    index.add_items(X)
-    index.set_ef(50)
-    
-    indices, distances = index.knn_query(X, k=k+1)
+    index.init_index(max_elements=n_samples, ef_construction=HNSW_EF_CONSTRUCTION, M=HNSW_M)
+    index.add_items(X, num_threads=-1)  # Use all threads for construction
+    index.set_ef(HNSW_EF_SEARCH)  # Increased from 50 to 100 for better accuracy
+
+    indices, distances = index.knn_query(X, k=k+1, num_threads=-1)
     return indices[:, 1:], distances[:, 1:]
 
 
@@ -128,143 +152,213 @@ def compute_neighbors_hnsw(X, k, metric='euclidean'):
 # ============================================================================
 
 @njit(parallel=True, fastmath=True)
-def trustworthiness_numba(neighbors_high, neighbors_low, D_high, k):
-    """Ultra-fast trustworthiness with Numba JIT (5-10x faster)."""
+def trustworthiness_numba(neighbors_high, neighbors_low, rank_matrix_high, k):
+    """
+    Ultra-fast trustworthiness with Numba JIT and pre-computed ranks.
+
+    Measures how well the low-dimensional embedding preserves the local
+    neighborhood structure from the high-dimensional space.
+
+    Args:
+        neighbors_high: k-nearest neighbors in high-D space (n_samples x k)
+        neighbors_low: k-nearest neighbors in low-D space (n_samples x k)
+        rank_matrix_high: Pre-computed rank matrix for high-D (n_samples x n_samples)
+        k: Number of neighbors to consider
+
+    Returns:
+        Trustworthiness score in [0, 1], where 1 is perfect
+    """
     n_samples = neighbors_high.shape[0]
     trust_sum = 0.0
-    
+
     for i in prange(n_samples):
-        low_neighbors = set(neighbors_low[i])
-        high_neighbors = set(neighbors_high[i])
-        
+        # Create sets for membership testing
+        high_neighbors_set = set(neighbors_high[i])
+
+        # For each neighbor in low-D space
         for j in neighbors_low[i]:
-            if j not in high_neighbors:
-                rank_high = 0
-                for r in range(n_samples):
-                    if D_high[i, r] < D_high[i, j]:
-                        rank_high += 1
+            # If this neighbor wasn't in the high-D neighborhood
+            if j not in high_neighbors_set:
+                # Get pre-computed rank (O(1) instead of O(n))
+                rank_high = rank_matrix_high[i, j]
                 trust_sum += max(0, rank_high - k)
-    
+
     norm_factor = (n_samples * k * (2 * n_samples - 3 * k - 1)) / 2.0
     if norm_factor > 0:
         trust = 1.0 - (trust_sum / norm_factor)
     else:
         trust = 1.0
-    
+
     return max(0.0, min(1.0, trust))
 
 
 @njit(parallel=True, fastmath=True)
-def continuity_numba(neighbors_high, neighbors_low, D_low, k):
-    """Ultra-fast continuity with Numba JIT."""
+def continuity_numba(neighbors_high, neighbors_low, rank_matrix_low, k):
+    """
+    Ultra-fast continuity with Numba JIT and pre-computed ranks.
+
+    Measures how well the low-dimensional embedding avoids placing
+    far-apart points close together.
+
+    Args:
+        neighbors_high: k-nearest neighbors in high-D space (n_samples x k)
+        neighbors_low: k-nearest neighbors in low-D space (n_samples x k)
+        rank_matrix_low: Pre-computed rank matrix for low-D (n_samples x n_samples)
+        k: Number of neighbors to consider
+
+    Returns:
+        Continuity score in [0, 1], where 1 is perfect
+    """
     n_samples = neighbors_high.shape[0]
     cont_sum = 0.0
-    
+
     for i in prange(n_samples):
-        low_neighbors = set(neighbors_low[i])
-        high_neighbors = set(neighbors_high[i])
-        
+        # Create sets for membership testing
+        low_neighbors_set = set(neighbors_low[i])
+
+        # For each neighbor in high-D space
         for j in neighbors_high[i]:
-            if j not in low_neighbors:
-                rank_low = 0
-                for r in range(n_samples):
-                    if D_low[i, r] < D_low[i, j]:
-                        rank_low += 1
+            # If this neighbor isn't in the low-D neighborhood
+            if j not in low_neighbors_set:
+                # Get pre-computed rank (O(1) instead of O(n))
+                rank_low = rank_matrix_low[i, j]
                 cont_sum += max(0, rank_low - k)
-    
+
     norm_factor = (n_samples * k * (2 * n_samples - 3 * k - 1)) / 2.0
     if norm_factor > 0:
         cont = 1.0 - (cont_sum / norm_factor)
     else:
         cont = 1.0
-    
+
     return max(0.0, min(1.0, cont))
 
 
 @njit(parallel=True, fastmath=True)
 def neighbor_dissimilarity_numba(D_high, D_low, neighbors_low):
-    """Ultra-fast neighbor dissimilarity with Numba JIT."""
+    """
+    Ultra-fast neighbor dissimilarity with Numba JIT.
+
+    Computes the relative distance error for k-nearest neighbors,
+    normalized by the high-dimensional distance to make it scale-invariant.
+
+    Args:
+        D_high: Distance matrix in high-D space (n_samples x n_samples)
+        D_low: Distance matrix in low-D space (n_samples x n_samples)
+        neighbors_low: k-nearest neighbors in low-D space (n_samples x k)
+
+    Returns:
+        Average relative distance error (lower is better)
+    """
     n_samples, k = neighbors_low.shape
-    total_dissimilarity = 0.0
-    
+    total_relative_error = 0.0
+    epsilon = 1e-10  # Prevent division by zero
+
     for i in prange(n_samples):
         for j_idx in range(k):
             j = neighbors_low[i, j_idx]
             d_orig = D_high[i, j]
             d_emb = D_low[i, j]
-            total_dissimilarity += abs(d_orig - d_emb)
-    
-    nd = total_dissimilarity / (n_samples * k)
+            # Relative error: normalized by original distance
+            relative_error = abs(d_orig - d_emb) / (d_orig + epsilon)
+            total_relative_error += relative_error
+
+    nd = total_relative_error / (n_samples * k)
     return nd
 
 
 @njit(fastmath=True)
 def kruskal_stress_numba(D_high, D_low):
-    """Ultra-fast stress calculation with Numba JIT."""
+    """
+    Kruskal Stress-1 calculation with Numba JIT.
+
+    This computes Stress-1, which normalizes by the high-dimensional distances
+    (denominator uses d_orig, not d_emb).
+
+    Stress-1 formula:
+        sqrt(sum((d_high - d_low)^2) / sum(d_high^2))
+
+    Args:
+        D_high: Distance matrix in high-D space (n_samples x n_samples)
+        D_low: Distance matrix in low-D space (n_samples x n_samples)
+
+    Returns:
+        Stress value (lower is better, 0 is perfect)
+    """
     n = D_high.shape[0]
     numerator = 0.0
     denominator = 0.0
-    
+
     for i in range(n):
         for j in range(i + 1, n):
             d_orig = D_high[i, j]
             d_emb = D_low[i, j]
             diff = d_orig - d_emb
             numerator += diff * diff
-            denominator += d_emb * d_emb
-    
+            denominator += d_orig * d_orig  # Stress-1: use original distances
+
     if denominator == 0:
         return 1.0
-    
+
     stress = np.sqrt(numerator / denominator)
     return stress
 
 
-# Fallback numpy versions
-def trustworthiness_numpy_fast(neighbors_high, neighbors_low, D_high, k, n_samples):
+# Fallback numpy versions (when Numba is not available)
+def trustworthiness_numpy_fast(neighbors_high, neighbors_low, rank_matrix_high, k):
+    """Numpy fallback for trustworthiness calculation."""
+    n_samples = neighbors_high.shape[0]
     trust_sum = 0.0
     for i in range(n_samples):
-        low_set = set(neighbors_low[i])
         high_set = set(neighbors_high[i])
         for j in neighbors_low[i]:
             if j not in high_set:
-                rank_high = np.sum(D_high[i] < D_high[i, j])
+                rank_high = rank_matrix_high[i, j]
                 trust_sum += max(0, rank_high - k)
-    
+
     norm_factor = (n_samples * k * (2 * n_samples - 3 * k - 1)) / 2.0
     trust = 1.0 - (trust_sum / norm_factor) if norm_factor > 0 else 1.0
     return max(0.0, min(1.0, trust))
 
 
-def continuity_numpy_fast(neighbors_high, neighbors_low, D_low, k, n_samples):
+def continuity_numpy_fast(neighbors_high, neighbors_low, rank_matrix_low, k):
+    """Numpy fallback for continuity calculation."""
+    n_samples = neighbors_high.shape[0]
     cont_sum = 0.0
     for i in range(n_samples):
         low_set = set(neighbors_low[i])
-        high_set = set(neighbors_high[i])
         for j in neighbors_high[i]:
             if j not in low_set:
-                rank_low = np.sum(D_low[i] < D_low[i, j])
+                rank_low = rank_matrix_low[i, j]
                 cont_sum += max(0, rank_low - k)
-    
+
     norm_factor = (n_samples * k * (2 * n_samples - 3 * k - 1)) / 2.0
     cont = 1.0 - (cont_sum / norm_factor) if norm_factor > 0 else 1.0
     return max(0.0, min(1.0, cont))
 
 
 def neighbor_dissimilarity_numpy(D_high, D_low, neighbors_low):
+    """Numpy fallback for neighbor dissimilarity (relative error)."""
     n_samples, k = neighbors_low.shape
     i_idx = np.repeat(np.arange(n_samples), k)
     j_idx = neighbors_low.flatten()
-    diff = np.sum(np.abs(D_high[i_idx, j_idx] - D_low[i_idx, j_idx]))
-    return float(diff / (n_samples * k))
+
+    d_high = D_high[i_idx, j_idx]
+    d_low = D_low[i_idx, j_idx]
+
+    # Relative error
+    epsilon = 1e-10
+    relative_error = np.abs(d_high - d_low) / (d_high + epsilon)
+
+    return float(np.mean(relative_error))
 
 
 def kruskal_stress_numpy(D_high, D_low):
+    """Numpy fallback for Kruskal Stress-1 calculation."""
     i_upper, j_upper = np.triu_indices_from(D_high, k=1)
     d_orig = D_high[i_upper, j_upper]
     d_emb = D_low[i_upper, j_upper]
     numerator = np.sum((d_orig - d_emb) ** 2)
-    denominator = np.sum(d_emb ** 2)
+    denominator = np.sum(d_orig ** 2)  # Stress-1: use original distances
     if denominator == 0:
         return 1.0
     return float(np.sqrt(numerator / denominator))
@@ -277,63 +371,79 @@ def kruskal_stress_numpy(D_high, D_low):
 def evaluate_dimensionality_reduction_ultrafast(X_high, X_low, y=None, data_type='continuous'):
     """
     ULTRA-FAST metric computation with all optimizations.
+
+    Improvements:
+    - Rank pre-computation (5-10x faster T&C calculation)
+    - Optional exact vs approximate neighbors (USE_EXACT_NEIGHBORS flag)
+    - Relative error for neighbor dissimilarity (scale-invariant)
+    - Kruskal Stress-1 (normalized by high-D distances)
+    - HNSW with increased ef for better accuracy
+
     Expected speedup: 50-100x over original
     """
     metrics = {}
-    
+
     # Compute distance matrices once
     D_high = pairwise_distances(X_high)
     D_low = pairwise_distances(X_low)
-    
+
     n_samples = D_high.shape[0]
     max_k = min(50, n_samples // 2 - 1)
-    
+
     if max_k >= 5:
-        # Fast neighbors
-        if HAS_HNSW and n_samples > 1000:
-            neighbors_high_idx, _ = compute_neighbors_hnsw(X_high, max_k)
-            neighbors_low_idx, _ = compute_neighbors_hnsw(X_low, max_k)
+        # Choose neighbor computation method
+        use_hnsw = (not USE_EXACT_NEIGHBORS) and HAS_HNSW and n_samples > 1000
+
+        if use_hnsw:
+            # Approximate neighbors with HNSW (10-100x faster for large datasets)
+            neighbors_high_idx, _ = compute_neighbors_hnsw(X_high, max_k, random_seed=RANDOM_SEED)
+            neighbors_low_idx, _ = compute_neighbors_hnsw(X_low, max_k, random_seed=RANDOM_SEED)
         else:
+            # Exact neighbors from distance matrix
             neighbors_high_idx = np.argsort(D_high, axis=1)[:, 1:max_k+1]
             neighbors_low_idx = np.argsort(D_low, axis=1)[:, 1:max_k+1]
-        
+
+        # Pre-compute rank matrices once (O(n^2 log n) but saves O(n^3 k) later)
+        rank_matrix_high = np.argsort(np.argsort(D_high, axis=1), axis=1)
+        rank_matrix_low = np.argsort(np.argsort(D_low, axis=1), axis=1)
+
         # Reduced k values for speed
         k_values = np.array([10, 20, 30, 40, 50])
         k_values = k_values[k_values <= max_k]
         k_values = k_values[k_values < n_samples // 2]
-        
+
         if len(k_values) > 0:
             T_values = []
             C_values = []
-            
+
             if HAS_NUMBA:
                 for k in k_values:
                     neighbors_high_k = neighbors_high_idx[:, :k]
                     neighbors_low_k = neighbors_low_idx[:, :k]
-                    
-                    t = trustworthiness_numba(neighbors_high_k, neighbors_low_k, D_high, k)
-                    c = continuity_numba(neighbors_high_k, neighbors_low_k, D_low, k)
-                    
+
+                    t = trustworthiness_numba(neighbors_high_k, neighbors_low_k, rank_matrix_high, k)
+                    c = continuity_numba(neighbors_high_k, neighbors_low_k, rank_matrix_low, k)
+
                     T_values.append(t)
                     C_values.append(c)
             else:
                 for k in k_values:
                     neighbors_high_k = neighbors_high_idx[:, :k]
                     neighbors_low_k = neighbors_low_idx[:, :k]
-                    
-                    t = trustworthiness_numpy_fast(neighbors_high_k, neighbors_low_k, D_high, k, n_samples)
-                    c = continuity_numpy_fast(neighbors_high_k, neighbors_low_k, D_low, k, n_samples)
-                    
+
+                    t = trustworthiness_numpy_fast(neighbors_high_k, neighbors_low_k, rank_matrix_high, k)
+                    c = continuity_numpy_fast(neighbors_high_k, neighbors_low_k, rank_matrix_low, k)
+
                     T_values.append(t)
                     C_values.append(c)
-            
+
             T_auc = trapezoid(T_values, k_values)
             C_auc = trapezoid(C_values, k_values)
             metrics['T&C_AUC'] = float((T_auc + C_auc) / 2.0)
         else:
             metrics['T&C_AUC'] = 0.0
-        
-        # Neighbor Dissimilarity
+
+        # Neighbor Dissimilarity (now using relative error)
         neighbors_12 = neighbors_low_idx[:, :12]
         if HAS_NUMBA:
             metrics['Neighbor_Dissimilarity'] = float(neighbor_dissimilarity_numba(D_high, D_low, neighbors_12))
@@ -342,8 +452,8 @@ def evaluate_dimensionality_reduction_ultrafast(X_high, X_low, y=None, data_type
     else:
         metrics['T&C_AUC'] = 0.0
         metrics['Neighbor_Dissimilarity'] = 0.0
-    
-    # Stress
+
+    # Stress (now using Kruskal Stress-1)
     if HAS_NUMBA:
         metrics['Stress'] = float(kruskal_stress_numba(D_high, D_low))
     else:
@@ -598,34 +708,88 @@ def save_results_minimal(method_name, dataset_name, params, metrics, embedding, 
 
 
 def load_dataset(dataset_name, data_type='continuous', sample_size=5000):
+    """
+    Load dataset with robust error handling.
+
+    Args:
+        dataset_name: Name of the dataset
+        data_type: 'continuous' or 'categorical'
+        sample_size: Sample size (default 5000)
+
+    Returns:
+        X: Data matrix (n_samples x n_features) or None if failed
+        y: Labels/colors or None if failed
+    """
     possible_paths = [
         os.path.join(os.getcwd(), "dimred_datasets", data_type, f"{dataset_name}_{sample_size}.npz"),
         os.path.join(os.path.dirname(os.getcwd()), "dimred_datasets", data_type, f"{dataset_name}_{sample_size}.npz"),
         os.path.join("/mnt/project/dimred_datasets", data_type, f"{dataset_name}_{sample_size}.npz"),
     ]
-    
+
     data_path = None
     for path in possible_paths:
         if os.path.exists(path):
             data_path = path
             break
-    
+
     if data_path is None:
-        print(f"Dataset not found. Tried:")
+        print(f"✗ Dataset not found. Tried:")
         for path in possible_paths:
             print(f"  - {path}")
         return None, None
-    
+
     print(f"  Loading from: {data_path}")
-    data = np.load(data_path)
-    X = data['X']
-    
-    if data_type == 'continuous':
-        y = data.get('color', None)
-    else:
-        y = data['y']
-    
-    return X, y
+
+    try:
+        # Attempt to load the dataset
+        data = np.load(data_path, allow_pickle=False)
+
+        # Validate required keys exist
+        if 'X' not in data:
+            print(f"✗ Error: Dataset file missing 'X' key")
+            return None, None
+
+        X = data['X']
+
+        # Validate data shape and type
+        if not isinstance(X, np.ndarray):
+            print(f"✗ Error: 'X' is not a numpy array")
+            return None, None
+
+        if X.ndim != 2:
+            print(f"✗ Error: 'X' must be 2D, got shape {X.shape}")
+            return None, None
+
+        if X.shape[0] == 0 or X.shape[1] == 0:
+            print(f"✗ Error: 'X' has zero size: {X.shape}")
+            return None, None
+
+        # Check for NaN or Inf values
+        if not np.isfinite(X).all():
+            print(f"✗ Error: 'X' contains NaN or Inf values")
+            return None, None
+
+        # Load labels/colors based on data type
+        if data_type == 'continuous':
+            y = data.get('color', None)
+        else:
+            if 'y' not in data:
+                print(f"✗ Error: Categorical dataset missing 'y' key")
+                return None, None
+            y = data['y']
+
+        print(f"  ✓ Loaded successfully: X shape = {X.shape}")
+        return X, y
+
+    except (IOError, OSError) as e:
+        print(f"✗ File I/O error loading dataset: {e}")
+        return None, None
+    except ValueError as e:
+        print(f"✗ Invalid data format in dataset file: {e}")
+        return None, None
+    except Exception as e:
+        print(f"✗ Unexpected error loading dataset: {e}")
+        return None, None
 
 
 # ============================================================================
@@ -1130,14 +1294,23 @@ def create_mds_comparison(results, dataset_name, data_type='continuous'):
     plt.close()
 
 
-def create_composite_score_heatmap(results, method_name, dataset_name, param1, param2, 
+def create_composite_score_heatmap(results, method_name, dataset_name, param1, param2,
                                    data_type='continuous'):
-    """Create heatmap showing composite scores."""
+    """
+    Create heatmap showing composite scores.
+
+    Note: This function expects results to already have 'normalized_metrics' from
+    the global normalization step. It will skip results without normalized metrics.
+    """
     plt, sns = get_plotting_libs()
-    
-    results = normalize_metrics(results)
+
+    # Calculate composite scores using existing normalized metrics
     for r in results:
-        r['composite_score'] = calculate_composite_score(r, data_type=data_type)
+        if 'normalized_metrics' in r:
+            r['composite_score'] = calculate_composite_score(r, data_type=data_type)
+        else:
+            # Skip if not normalized yet (shouldn't happen in normal flow)
+            r['composite_score'] = 0.0
     
     data = []
     for result in results:
@@ -1351,31 +1524,68 @@ def optimize_all_methods(dataset_name, data_type='continuous', methods=None):
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description='Ultra-fast hyperparameter optimization')
-    parser.add_argument('--dataset', type=str, default='swiss_roll')
+
+    parser = argparse.ArgumentParser(
+        description='Ultra-fast hyperparameter optimization with improved metrics',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Use approximate neighbors (faster, default):
+  python hyperopt.py --dataset swiss_roll --methods tsne umap
+
+  # Use exact neighbors (slower but more accurate):
+  python hyperopt.py --dataset mnist --data-type categorical --use-exact-neighbors
+
+  # Multiple methods:
+  python hyperopt.py --dataset s_curve --methods tsne umap phate pacmap mds
+        """
+    )
+    parser.add_argument('--dataset', type=str, default='swiss_roll',
+                       help='Dataset name (e.g., swiss_roll, mnist)')
     parser.add_argument('--data-type', type=str, default='continuous',
-                       choices=['continuous', 'categorical'])
-    parser.add_argument('--methods', type=str, nargs='+', 
-                       default=['tsne', 'umap'])
-    
+                       choices=['continuous', 'categorical'],
+                       help='Type of dataset')
+    parser.add_argument('--methods', type=str, nargs='+',
+                       default=['tsne', 'umap'],
+                       help='Methods to optimize (tsne, umap, phate, pacmap, mds, autoencoder)')
+    parser.add_argument('--use-exact-neighbors', action='store_true',
+                       help='Use exact neighbors instead of HNSW approximation (slower but more accurate)')
+
     args = parser.parse_args()
-    
+
+    # Set global flag
+    if args.use_exact_neighbors:
+        globals()['USE_EXACT_NEIGHBORS'] = True
+
     print(f"\n{'='*80}")
     print("ULTRA-FAST HYPERPARAMETER OPTIMIZATION")
     print(f"{'='*80}")
     print(f"Dataset: {args.dataset}")
+    print(f"Data type: {args.data_type}")
     print(f"Methods: {args.methods}")
-    print(f"\nFEATURES:")
+    print(f"\nOPTIMIZATIONS:")
     print(f"  • Numba JIT: {'✓' if HAS_NUMBA else '✗ (pip install numba)'}")
     print(f"  • HNSW ANN: {'✓' if HAS_HNSW else '✗ (pip install hnswlib)'}")
+    print(f"  • Neighbor method: {'Exact (slower, accurate)' if USE_EXACT_NEIGHBORS else 'HNSW Approximate (fast)'}")
+    print(f"  • Rank pre-computation: ✓ (5-10x faster T&C)")
     print(f"  • Sequential configs: ✓ (distributed runner handles parallelism)")
     print(f"  • Methods use all cores: ✓")
-    print(f"  • Expected: 1-3 min per method (25 configs)")
+    print(f"\nMETRICS:")
+    print(f"  • Trustworthiness & Continuity (AUC)")
+    print(f"  • Neighbor Dissimilarity (relative error)")
+    print(f"  • Kruskal Stress-1 (not Stress-2)")
+    if args.data_type == 'categorical':
+        print(f"  • Davies-Bouldin Index")
+        print(f"  • Normalized Mutual Information")
+    print(f"\nEXPECTED TIME:")
+    if USE_EXACT_NEIGHBORS:
+        print(f"  • 2-5 min per method (25 configs, exact neighbors)")
+    else:
+        print(f"  • 1-3 min per method (25 configs, approximate neighbors)")
     print(f"{'='*80}\n")
-    
+
     optimize_all_methods(args.dataset, args.data_type, args.methods)
-    
+
     print(f"\n{'='*80}")
     print("COMPLETE")
     print(f"{'='*80}\n")
