@@ -443,12 +443,12 @@ def evaluate_dimensionality_reduction_ultrafast(X_high, X_low, y=None, data_type
         else:
             metrics['T&C_AUC'] = 0.0
 
-        # Neighbor Dissimilarity (now using relative error)
-        neighbors_12 = neighbors_low_idx[:, :12]
+        # Neighbor Dissimilarity (using relative error with k=10)
+        neighbors_10 = neighbors_low_idx[:, :10]
         if HAS_NUMBA:
-            metrics['Neighbor_Dissimilarity'] = float(neighbor_dissimilarity_numba(D_high, D_low, neighbors_12))
+            metrics['Neighbor_Dissimilarity'] = float(neighbor_dissimilarity_numba(D_high, D_low, neighbors_10))
         else:
-            metrics['Neighbor_Dissimilarity'] = neighbor_dissimilarity_numpy(D_high, D_low, neighbors_12)
+            metrics['Neighbor_Dissimilarity'] = neighbor_dissimilarity_numpy(D_high, D_low, neighbors_10)
     else:
         metrics['T&C_AUC'] = 0.0
         metrics['Neighbor_Dissimilarity'] = 0.0
