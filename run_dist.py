@@ -94,38 +94,72 @@ class TaskCoordinator:
         self.machine_id = f"{self.hostname}_{self.pid}"
     
     def initialize_tasks(self, datasets, methods):
-        """Create task files for all dataset-method combinations."""
+        """
+        Create task files for all dataset-method combinations.
+
+        Creates two types of tasks:
+        1. Optimization tasks (one per dataset-method combination)
+        2. Normalization tasks (one per dataset, runs after all methods complete)
+        """
         tasks = []
-        
-        # Continuous datasets
-        for dataset in datasets.get('continuous', []):
+
+        # Track datasets for normalization tasks
+        all_datasets_continuous = datasets.get('continuous', [])
+        all_datasets_categorical = datasets.get('categorical', [])
+
+        # Continuous datasets - optimization tasks
+        for dataset in all_datasets_continuous:
             for method in methods:
                 task = {
                     'dataset': dataset,
                     'data_type': 'continuous',
                     'method': method,
+                    'task_type': 'optimize',
                     'task_id': f"continuous_{dataset}_{method}"
                 }
                 tasks.append(task)
-        
-        # Categorical datasets
-        for dataset in datasets.get('categorical', []):
+
+        # Categorical datasets - optimization tasks
+        for dataset in all_datasets_categorical:
             for method in methods:
                 task = {
                     'dataset': dataset,
                     'data_type': 'categorical',
                     'method': method,
+                    'task_type': 'optimize',
                     'task_id': f"categorical_{dataset}_{method}"
                 }
                 tasks.append(task)
-        
+
+        # Normalization tasks (one per dataset)
+        # These run after all methods for a dataset complete
+        for dataset in all_datasets_continuous:
+            task = {
+                'dataset': dataset,
+                'data_type': 'continuous',
+                'task_type': 'normalize',
+                'task_id': f"continuous_{dataset}_normalize",
+                'depends_on': [f"continuous_{dataset}_{method}" for method in methods]
+            }
+            tasks.append(task)
+
+        for dataset in all_datasets_categorical:
+            task = {
+                'dataset': dataset,
+                'data_type': 'categorical',
+                'task_type': 'normalize',
+                'task_id': f"categorical_{dataset}_normalize",
+                'depends_on': [f"categorical_{dataset}_{method}" for method in methods]
+            }
+            tasks.append(task)
+
         # Write task files
         for task in tasks:
             task_file = self.tasks_dir / f"{task['task_id']}.json"
             if not task_file.exists():
                 with open(task_file, 'w') as f:
                     json.dump(task, f, indent=2)
-        
+
         return tasks
     
     def is_task_completed(self, task_id):
@@ -205,10 +239,24 @@ class TaskCoordinator:
         except:
             pass
     
+    def dependencies_satisfied(self, task):
+        """Check if all dependencies for a task are satisfied."""
+        depends_on = task.get('depends_on', [])
+
+        if not depends_on:
+            return True  # No dependencies
+
+        # Check if all dependencies are completed
+        for dep_task_id in depends_on:
+            if not self.is_task_completed(dep_task_id):
+                return False
+
+        return True
+
     def mark_completed(self, task_id, success, elapsed_time, error=None):
         """Mark a task as completed."""
         completed_file = self.completed_dir / f"{task_id}.done"
-        
+
         completion_info = {
             'task_id': task_id,
             'machine_id': self.machine_id,
@@ -218,36 +266,41 @@ class TaskCoordinator:
             'timestamp': datetime.now().isoformat(),
             'error': str(error) if error else None
         }
-        
+
         with open(completed_file, 'w') as f:
             json.dump(completion_info, f, indent=2)
-        
+
         # Release lock
         self.release_lock(task_id)
     
     def get_available_task(self):
-        """Get the next available task (not completed, not locked)."""
+        """Get the next available task (not completed, not locked, dependencies satisfied)."""
         # Get all task files
         task_files = sorted(self.tasks_dir.glob("*.json"))
-        
+
         for task_file in task_files:
             task_id = task_file.stem
-            
+
             # Skip if completed
             if self.is_task_completed(task_id):
                 continue
-            
+
             # Skip if locked
             if self.is_task_locked(task_id):
                 continue
-            
+
+            # Load task to check dependencies
+            with open(task_file, 'r') as f:
+                task = json.load(f)
+
+            # Skip if dependencies not satisfied
+            if not self.dependencies_satisfied(task):
+                continue
+
             # Try to acquire lock
             if self.acquire_lock(task_id):
-                # Load task
-                with open(task_file, 'r') as f:
-                    task = json.load(f)
                 return task
-        
+
         return None
     
     def get_progress_summary(self):
@@ -270,17 +323,28 @@ class TaskCoordinator:
 
 
 def run_task(task):
-    """Run a single optimization task."""
+    """Run a single optimization or normalization task."""
     dataset = task['dataset']
     data_type = task['data_type']
-    method = task['method']
-    
-    cmd = [
-        'python', 'hyperopt.py',
-        '--dataset', dataset,
-        '--data-type', data_type,
-        '--methods', method
-    ]
+    task_type = task.get('task_type', 'optimize')  # 'optimize' or 'normalize'
+
+    if task_type == 'normalize':
+        # Normalization task
+        cmd = [
+            'python', 'normalize_results.py',
+            '--dataset', dataset,
+            '--data-type', data_type
+        ]
+    else:
+        # Optimization task
+        method = task['method']
+        cmd = [
+            'python', 'hyperopt.py',
+            '--dataset', dataset,
+            '--data-type', data_type,
+            '--methods', method,
+            '--skip-normalization'  # Skip normalization in distributed mode
+        ]
     
     print(f"\n{'='*80}")
     print(f"Running: {' '.join(cmd)}")

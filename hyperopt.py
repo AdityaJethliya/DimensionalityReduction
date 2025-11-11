@@ -1349,8 +1349,16 @@ def create_composite_score_heatmap(results, method_name, dataset_name, param1, p
 # MAIN OPTIMIZATION PIPELINE
 # ============================================================================
 
-def optimize_all_methods(dataset_name, data_type='continuous', methods=None):
-    """Run ultra-fast optimization for all methods."""
+def optimize_all_methods(dataset_name, data_type='continuous', methods=None, skip_normalization=False):
+    """
+    Run ultra-fast optimization for all methods.
+
+    Args:
+        dataset_name: Name of the dataset
+        data_type: 'continuous' or 'categorical'
+        methods: List of methods to optimize
+        skip_normalization: If True, skip global normalization (for distributed runs)
+    """
     print(f"\n{'#'*80}")
     print(f"# ULTRA-FAST HYPERPARAMETER OPTIMIZATION: {dataset_name} ({data_type})")
     print(f"{'#'*80}")
@@ -1392,19 +1400,28 @@ def optimize_all_methods(dataset_name, data_type='continuous', methods=None):
     
     if 'autoencoder' in methods:
         all_results['autoencoder'] = optimize_autoencoder(X, y, dataset_name, data_type)
-    
+
+    # Filter out empty results
+    all_results_filtered = {k: v for k, v in all_results.items() if len(v) > 0}
+
+    if len(all_results_filtered) == 0:
+        print("No results to process!")
+        return
+
+    # Conditional normalization and visualization
+    if skip_normalization:
+        print(f"\n{'='*80}")
+        print("SKIPPING NORMALIZATION (Distributed Mode)")
+        print(f"{'='*80}")
+        print(f"  Raw metrics saved. Run normalize_results.py after all methods complete.")
+        print(f"  Total configs saved: {sum(len(v) for v in all_results_filtered.values())}")
+        return  # Exit early without normalization
+
     # Step 2: Global normalization across ALL methods
     print(f"\n{'='*80}")
     print("STEP 2: GLOBAL NORMALIZATION")
     print(f"{'='*80}")
-    
-    # Filter out empty results
-    all_results_filtered = {k: v for k, v in all_results.items() if len(v) > 0}
-    
-    if len(all_results_filtered) == 0:
-        print("No results to normalize!")
-        return
-    
+
     # Normalize globally across all methods
     all_results_filtered = normalize_metrics_globally(all_results_filtered, data_type)
     
@@ -1550,6 +1567,8 @@ Examples:
                        help='Methods to optimize (tsne, umap, phate, pacmap, mds, autoencoder)')
     parser.add_argument('--use-exact-neighbors', action='store_true',
                        help='Use exact neighbors instead of HNSW approximation (slower but more accurate)')
+    parser.add_argument('--skip-normalization', action='store_true',
+                       help='Skip global normalization (for distributed runs - normalize later with normalize_results.py)')
 
     args = parser.parse_args()
 
@@ -1584,8 +1603,16 @@ Examples:
         print(f"  • 1-3 min per method (25 configs, approximate neighbors)")
     print(f"{'='*80}\n")
 
-    optimize_all_methods(args.dataset, args.data_type, args.methods)
+    optimize_all_methods(args.dataset, args.data_type, args.methods, skip_normalization=args.skip_normalization)
 
-    print(f"\n{'='*80}")
-    print("COMPLETE")
-    print(f"{'='*80}\n")
+    if args.skip_normalization:
+        print(f"\n{'='*80}")
+        print("OPTIMIZATION COMPLETE (Normalization skipped)")
+        print(f"{'='*80}")
+        print(f"\nTo normalize results globally across all methods, run:")
+        print(f"  python normalize_results.py --dataset {args.dataset} --data-type {args.data_type}")
+        print(f"{'='*80}\n")
+    else:
+        print(f"\n{'='*80}")
+        print("COMPLETE")
+        print(f"{'='*80}\n")
