@@ -442,10 +442,17 @@ def main():
         
         # Run the task
         task_id = task['task_id']
+        task_type = task.get('task_type', 'optimize')
+
         print(f"\n{'='*80}")
         print(f"📋 Picked up task: {task_id}")
         print(f"   Dataset: {task['dataset']} ({task['data_type']})")
-        print(f"   Method: {task['method']}")
+
+        if task_type == 'normalize':
+            print(f"   Type: Global Normalization")
+        else:
+            print(f"   Method: {task['method']}")
+
         print(f"{'='*80}")
         
         success, elapsed, error = run_task(task)
